@@ -4211,11 +4211,46 @@ GO
                   <entry>The port of the Citus load balancer used to distribute
                   connections across worker nodes. This setting is enabled when
                   Azure Citus is enabled. When set and Citus Compatible mode is
-                  also enabled, schema data population and OLTP benchmark
-                  workload connections will be routed through this port instead
-                  of the standard PostgreSQL port. DDL operations are always
-                  routed through the coordinator via the standard PostgreSQL
-                  port. The default value is 5432.</entry>
+                  also enabled, OLTP benchmark workload connections will be
+                  routed through this port instead of the standard PostgreSQL
+                  port. DDL operations are always routed through the
+                  coordinator via the standard PostgreSQL port. Note that on
+                  the Citus build path the load balancer port is bypassed:
+                  data loading is balanced explicitly by warehouse-to-node
+                  placement (see Citus Direct Worker Loading) rather than by
+                  the external load balancer. The default value is
+                  5432.</entry>
+                </row>
+
+                <row>
+                  <entry>Citus Direct Worker Loading</entry>
+
+                  <entry>When Citus Compatible mode is enabled, controls how
+                  the data-load workers connect during schema build. When
+                  unchecked (default), all workers connect to the coordinator
+                  (PostgreSQL Host / Port) and Citus routes the writes to the
+                  owning worker node; warehouses are still bucketed by
+                  placement so each worker only loads warehouses whose shards
+                  live on its assigned node. When checked, each worker
+                  connects directly to its assigned worker node
+                  (nodename:nodeport from pg_dist_node) and issues COPY
+                  statements against the physical shard tables resolved via
+                  shard_name() and get_shard_id_for_distribution_column().
+                  Because each transaction then touches exactly one PostgreSQL
+                  backend, Citus commits the load through single-phase commit
+                  (1PC) instead of the two-phase commit (2PC) protocol that
+                  applies whenever the distributed executor fans out to more
+                  than one backend, removing the per-transaction prepare /
+                  commit round trips and substantially reducing build time on
+                  large clusters. This is the fastest build path for clusters
+                  where the HammerDB client has direct network access to all
+                  worker nodes. If a direct connection fails the worker
+                  transparently falls back to the coordinator. The placement
+                  map is built once by the monitor VU immediately after CREATE
+                  TABLE / create_distributed_table and before workers are
+                  released, so per-warehouse work is pinned to the correct
+                  node in either mode. This option has no effect when Citus
+                  Compatible mode is disabled.</entry>
                 </row>
 
                 <row>
@@ -4336,7 +4371,11 @@ GO
                   count on your Database Server then also installing HammerDB
                   locally on this server as well to run the schema build can
                   take advantage of the higher core count to run the build
-                  more quickly.</entry>
+                  more quickly. When Citus Compatible mode is enabled, this
+                  value may be set to -1 to request automatic sizing: HammerDB
+                  resolves it to the Number of Warehouses, spawning one worker
+                  per warehouse plus the monitor VU for peak parallelism on
+                  the placement-aware data loader.</entry>
                 </row>
               </tbody>
             </tgroup>

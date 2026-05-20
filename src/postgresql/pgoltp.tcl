@@ -1755,10 +1755,28 @@ proc getisotimestamp { } {
 }
 
 
-proc Customer { lda d_id w_id CUST_PER_DIST ora_compatible } {
+proc citus_default_tabmap {} {
+    #Identity table-name map: used by all non-Citus paths and by Citus paths
+    #that go through the coordinator. Workers in direct-shard mode override this
+    #with the per-warehouse shard-qualified names produced by BuildCitusPlacementMap.
+    return [list \
+        warehouse  warehouse  \
+        district   district   \
+        customer   customer   \
+        history    history    \
+        stock      stock      \
+        orders     orders     \
+        new_order  new_order  \
+        order_line order_line]
+}
+
+proc Customer { lda d_id w_id CUST_PER_DIST ora_compatible {tabmap ""} } {
     set globArray [ list 0 1 2 3 4 5 6 7 8 9 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z ]
     set namearr [list BAR OUGHT ABLE PRI PRES ESE ANTI CALLY ATION EING]
     set chalen [ llength $globArray ]
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
+    set t_customer [dict get $tabmap customer]
+    set t_history  [dict get $tabmap history]
     set c_d_id $d_id
     set c_w_id $w_id
     set c_middle "OE"
@@ -1787,42 +1805,46 @@ proc Customer { lda d_id w_id CUST_PER_DIST ora_compatible } {
         append c_csv_rows $c_id,$c_d_id,$c_w_id,$c_first,$c_middle,$c_last,[ lindex $c_add 0 ],[ lindex $c_add 1 ],[ lindex $c_add 2 ],[ lindex $c_add 3 ],[ lindex $c_add 4 ],$c_phone,[ getisotimestamp ],$c_credit,$c_credit_lim,$c_discount,$c_balance,$c_data,10.0,1,0\n
         set h_data [ MakeAlphaString 12 24 $globArray $chalen ]
         append h_csv_rows $c_id,$c_d_id,$c_w_id,$c_w_id,$c_d_id,[getisotimestamp],$h_amount,$h_data\n
-        if { ![ expr {$c_id % 1000} ] } {
-            set result [ pg_exec $lda "COPY customer (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_data, c_ytd_payment, c_payment_cnt, c_delivery_cnt) FROM STDIN WITH (FORMAT CSV)" ]
-            if {[pg_result $result -status] != "PGRES_COPY_IN"} {
-                error "[pg_result $result -error]"
-            }
-            puts -nonewline $lda $c_csv_rows
-            puts $lda "\\."
-            if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
-                error "[pg_result $result -error]"
-            } else {
-                pg_result $result -clear
-            }
-            set result [ pg_exec $lda "COPY history (h_c_id, h_c_d_id, h_c_w_id, h_w_id, h_d_id, h_date, h_amount, h_data) FROM STDIN WITH (FORMAT CSV)" ]
-            if {[pg_result $result -status] != "PGRES_COPY_IN"} {
-                error "[pg_result $result -error]"
-            }
-            puts -nonewline $lda $h_csv_rows
-            puts $lda "\\."
-            if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
-                error "[pg_result $result -error]"
-            } else {
-                pg_result $result -clear
-            }
-            set result [ pg_exec $lda "commit" ]
-            pg_result $result -clear
-            unset c_csv_rows
-            unset h_csv_rows
-        }
     }
+    #Single COPY + commit for the whole district's customers and history rows.
+    #Previously this flushed every 1000 rows, producing 3 distributed 2PC commits
+    #per district call (30 per warehouse). On Citus each commit is a multi-node
+    #2PC round-trip, which dominated load wall-time.
+    set result [ pg_exec $lda "COPY $t_customer (c_id, c_d_id, c_w_id, c_first, c_middle, c_last, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, c_discount, c_balance, c_data, c_ytd_payment, c_payment_cnt, c_delivery_cnt) FROM STDIN WITH (FORMAT CSV)" ]
+    if {[pg_result $result -status] != "PGRES_COPY_IN"} {
+        error "[pg_result $result -error]"
+    }
+    puts -nonewline $lda $c_csv_rows
+    puts $lda "\\."
+    if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
+        error "[pg_result $result -error]"
+    } else {
+        pg_result $result -clear
+    }
+    set result [ pg_exec $lda "COPY $t_history (h_c_id, h_c_d_id, h_c_w_id, h_w_id, h_d_id, h_date, h_amount, h_data) FROM STDIN WITH (FORMAT CSV)" ]
+    if {[pg_result $result -status] != "PGRES_COPY_IN"} {
+        error "[pg_result $result -error]"
+    }
+    puts -nonewline $lda $h_csv_rows
+    puts $lda "\\."
+    if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
+        error "[pg_result $result -error]"
+    } else {
+        pg_result $result -clear
+    }
+    set result [ pg_exec $lda "commit" ]
+    pg_result $result -clear
     puts "Customer Done"
     return
 }
 
-proc Orders { lda d_id w_id MAXITEMS ORD_PER_DIST ora_compatible } {
+proc Orders { lda d_id w_id MAXITEMS ORD_PER_DIST ora_compatible {tabmap ""} } {
     set globArray [ list 0 1 2 3 4 5 6 7 8 9 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z ]
     set chalen [ llength $globArray ]
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
+    set t_orders     [dict get $tabmap orders]
+    set t_new_order  [dict get $tabmap new_order]
+    set t_order_line [dict get $tabmap order_line]
     puts "Loading Orders for D=$d_id W=$w_id"
     set o_d_id $d_id
     set o_w_id $w_id
@@ -1865,51 +1887,45 @@ proc Orders { lda d_id w_id MAXITEMS ORD_PER_DIST ora_compatible } {
                 append ol_csv_rows $o_id,$o_d_id,$o_w_id,$ol,$ol_i_id,$ol_supply_w_id,$ol_quantity,$ol_amount,$ol_dist_info,[getisotimestamp]\n
             }
         }
-        if { ![ expr {$o_id % 100} ] } {
-            if { ![ expr {$o_id % 1000} ] } {
-                puts "...$o_id"
-            }
-            set result [ pg_exec $lda  "COPY orders (o_id, o_c_id, o_d_id, o_w_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) FROM STDIN WITH (FORMAT CSV)" ]
-            if {[pg_result $result -status] != "PGRES_COPY_IN"} {
-                error "[pg_result $result -error]"
-            }
-            puts -nonewline $lda $o_csv_rows
-            puts $lda "\\."
-            if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
-                error "[pg_result $result -error]"
-            } else {
-                pg_result $result -clear
-            }
-            if { $o_id > 2100 } {
-                set result [ pg_exec $lda "COPY new_order (no_o_id, no_d_id, no_w_id) FROM STDIN WITH (FORMAT CSV)" ]
-                if {[pg_result $result -status] != "PGRES_COPY_IN"} {
-                    error "[pg_result $result -error]"
-                }
-                puts -nonewline $lda $no_csv_rows
-                puts $lda "\\."
-                if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
-                    error "[pg_result $result -error]"
-                } else {
-                    pg_result $result -clear
-                }
-            }
-            set result [ pg_exec $lda "COPY order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info, ol_delivery_d) FROM STDIN WITH (FORMAT CSV)" ]
-            if {[pg_result $result -status] != "PGRES_COPY_IN"} {
-                error "[pg_result $result -error]"
-            }
-            puts -nonewline $lda $ol_csv_rows
-            puts $lda "\\."
-            if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
-                error "[pg_result $result -error]"
-            } else {
-                pg_result $result -clear
-            }
-            set result [ pg_exec $lda "commit" ]
-            pg_result $result -clear
-            unset o_csv_rows
-            unset -nocomplain no_csv_rows
-            unset ol_csv_rows
+    }
+    #Single COPY + commit for the whole district's orders/new_order/order_line.
+    #Previously this flushed every 100 rows, producing ~30 distributed 2PC commits
+    #per district call (~300 per warehouse). On Citus each commit is a multi-node
+    #2PC round-trip, which dominated load wall-time.
+    set result [ pg_exec $lda  "COPY $t_orders (o_id, o_c_id, o_d_id, o_w_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) FROM STDIN WITH (FORMAT CSV)" ]
+    if {[pg_result $result -status] != "PGRES_COPY_IN"} {
+        error "[pg_result $result -error]"
+    }
+    puts -nonewline $lda $o_csv_rows
+    puts $lda "\\."
+    if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
+        error "[pg_result $result -error]"
+    } else {
+        pg_result $result -clear
+    }
+    if { [ info exists no_csv_rows ] } {
+        set result [ pg_exec $lda "COPY $t_new_order (no_o_id, no_d_id, no_w_id) FROM STDIN WITH (FORMAT CSV)" ]
+        if {[pg_result $result -status] != "PGRES_COPY_IN"} {
+            error "[pg_result $result -error]"
         }
+        puts -nonewline $lda $no_csv_rows
+        puts $lda "\\."
+        if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
+            error "[pg_result $result -error]"
+        } else {
+            pg_result $result -clear
+        }
+    }
+    set result [ pg_exec $lda "COPY $t_order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_dist_info, ol_delivery_d) FROM STDIN WITH (FORMAT CSV)" ]
+    if {[pg_result $result -status] != "PGRES_COPY_IN"} {
+        error "[pg_result $result -error]"
+    }
+    puts -nonewline $lda $ol_csv_rows
+    puts $lda "\\."
+    if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
+        error "[pg_result $result -error]"
+    } else {
+        pg_result $result -clear
     }
     set result [ pg_exec $lda "commit" ]
     pg_result $result -clear
@@ -1967,10 +1983,12 @@ proc LoadItems { lda MAXITEMS } {
     return
 }
 
-proc Stock { lda w_id MAXITEMS } {
+proc Stock { lda w_id MAXITEMS {tabmap ""} } {
     set globArray [ list 0 1 2 3 4 5 6 7 8 9 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z ]
     set chalen [ llength $globArray ]
-    set result [ pg_exec $lda "COPY stock (s_i_id, s_w_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_data, s_ytd, s_order_cnt, s_remote_cnt) FROM STDIN WITH (FORMAT CSV)" ]
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
+    set t_stock [dict get $tabmap stock]
+    set result [ pg_exec $lda "COPY $t_stock (s_i_id, s_w_id, s_quantity, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_data, s_ytd, s_order_cnt, s_remote_cnt) FROM STDIN WITH (FORMAT CSV)" ]
     if {[pg_result $result -status] != "PGRES_COPY_IN"} {
         error "[pg_result $result -error]"
     }
@@ -2024,9 +2042,11 @@ proc Stock { lda w_id MAXITEMS } {
     return
 }
 
-proc District { lda w_id DIST_PER_WARE } {
+proc District { lda w_id DIST_PER_WARE {tabmap ""} } {
     set globArray [ list 0 1 2 3 4 5 6 7 8 9 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z ]
     set chalen [ llength $globArray ]
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
+    set t_district [dict get $tabmap district]
     puts "Loading District"
     set d_w_id $w_id
     set d_ytd 30000.0
@@ -2036,7 +2056,7 @@ proc District { lda w_id DIST_PER_WARE } {
         set d_add [ MakeAddress $globArray $chalen ]
         set d_tax_ran [ RandomNumber 10 20 ]
         set d_tax [ string replace [ format "%.2f" [ expr {$d_tax_ran / 100.0} ] ] 0 0 "" ]
-        set result [ pg_exec $lda "insert into district (d_id, d_w_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip, d_tax, d_ytd, d_next_o_id) values ('$d_id', '$d_w_id', '$d_name', '[ lindex $d_add 0 ]', '[ lindex $d_add 1 ]', '[ lindex $d_add 2 ]', '[ lindex $d_add 3 ]', '[ lindex $d_add 4 ]', '$d_tax', '$d_ytd', '$d_next_o_id')" ]
+        set result [ pg_exec $lda "insert into $t_district (d_id, d_w_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip, d_tax, d_ytd, d_next_o_id) values ('$d_id', '$d_w_id', '$d_name', '[ lindex $d_add 0 ]', '[ lindex $d_add 1 ]', '[ lindex $d_add 2 ]', '[ lindex $d_add 3 ]', '[ lindex $d_add 4 ]', '$d_tax', '$d_ytd', '$d_next_o_id')" ]
         if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
             error "[pg_result $result -error]"
             return
@@ -2050,9 +2070,11 @@ proc District { lda w_id DIST_PER_WARE } {
     return
 }
 
-proc LoadWare { lda ware_start count_ware MAXITEMS DIST_PER_WARE } {
+proc LoadWare { lda ware_start count_ware MAXITEMS DIST_PER_WARE {tabmap ""} } {
     set globArray [ list 0 1 2 3 4 5 6 7 8 9 A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z ]
     set chalen [ llength $globArray ]
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
+    set t_warehouse [dict get $tabmap warehouse]
     puts "Loading Warehouse"
     set w_ytd 300000.00
     for {set w_id $ware_start } {$w_id <= $count_ware } {incr w_id } {
@@ -2060,23 +2082,24 @@ proc LoadWare { lda ware_start count_ware MAXITEMS DIST_PER_WARE } {
         set add [ MakeAddress $globArray $chalen ]
         set w_tax_ran [ RandomNumber 10 20 ]
         set w_tax [ string replace [ format "%.2f" [ expr {$w_tax_ran / 100.0} ] ] 0 0 "" ]
-        set result [ pg_exec $lda "insert into warehouse (w_id, w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_tax, w_ytd) values ('$w_id', '$w_name', '[ lindex $add 0 ]', '[ lindex $add 1 ]', '[ lindex $add 2 ]' , '[ lindex $add 3 ]', '[ lindex $add 4 ]', '$w_tax', '$w_ytd')" ]
+        set result [ pg_exec $lda "insert into $t_warehouse (w_id, w_name, w_street_1, w_street_2, w_city, w_state, w_zip, w_tax, w_ytd) values ('$w_id', '$w_name', '[ lindex $add 0 ]', '[ lindex $add 1 ]', '[ lindex $add 2 ]' , '[ lindex $add 3 ]', '[ lindex $add 4 ]', '$w_tax', '$w_ytd')" ]
         if {[pg_result $result -status] != "PGRES_COMMAND_OK"} {
             error "[pg_result $result -error]"
         } else {
             pg_result $result -clear
         }
-        Stock $lda $w_id $MAXITEMS
-        District $lda $w_id $DIST_PER_WARE
+        Stock $lda $w_id $MAXITEMS $tabmap
+        District $lda $w_id $DIST_PER_WARE $tabmap
         set result [ pg_exec $lda "commit" ]
         pg_result $result -clear
     }
 }
 
-proc LoadCust { lda ware_start count_ware CUST_PER_DIST DIST_PER_WARE ora_compatible } {
+proc LoadCust { lda ware_start count_ware CUST_PER_DIST DIST_PER_WARE ora_compatible {tabmap ""} } {
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
     for {set w_id $ware_start} {$w_id <= $count_ware } {incr w_id } {
         for {set d_id 1} {$d_id <= $DIST_PER_WARE } {incr d_id } {
-            Customer $lda $d_id $w_id $CUST_PER_DIST $ora_compatible
+            Customer $lda $d_id $w_id $CUST_PER_DIST $ora_compatible $tabmap
         }
     }
     set result [ pg_exec $lda "commit" ]
@@ -2084,10 +2107,11 @@ proc LoadCust { lda ware_start count_ware CUST_PER_DIST DIST_PER_WARE ora_compat
     return
 }
 
-proc LoadOrd { lda ware_start count_ware MAXITEMS ORD_PER_DIST DIST_PER_WARE ora_compatible } {
+proc LoadOrd { lda ware_start count_ware MAXITEMS ORD_PER_DIST DIST_PER_WARE ora_compatible {tabmap ""} } {
+    if { $tabmap eq "" } { set tabmap [citus_default_tabmap] }
     for {set w_id $ware_start} {$w_id <= $count_ware } {incr w_id } {
         for {set d_id 1} {$d_id <= $DIST_PER_WARE } {incr d_id } {
-            Orders $lda $d_id $w_id $MAXITEMS $ORD_PER_DIST $ora_compatible
+            Orders $lda $d_id $w_id $MAXITEMS $ORD_PER_DIST $ora_compatible $tabmap
         }
     }
     set result [ pg_exec $lda "commit" ]
@@ -2107,16 +2131,31 @@ proc GetDataPort { port citus_lb_port azure_citus citus_compatible } {
 #Stores in tsv shared state:
 #   citus(nodes)        -> ordered list of node keys "host:port"
 #   citus_ware($nk)     -> list of warehouse IDs hosted on $nk
-proc BuildCitusPlacementMap { lda count_ware } {
+proc BuildCitusPlacementMap { lda host count_ware } {
     puts "Building Citus warehouse placement map for $count_ware warehouse(s)"
-    set sql "SELECT w.w_id, n.nodename || ':' || n.nodeport AS node_key \
+    #Host comes from the HammerDB connection (pg_host); the catalog's nodename is
+    #ignored because on managed services (e.g. Azure Cosmos DB for PostgreSQL) the
+    #internal nodename/nodeport are not reachable from external clients. We only
+    #use the catalog to map warehouse -> port offset, then translate the internal
+    #pgbouncer port (7000+N) to the public-facing port (5432+N).
+    set sql "SELECT DISTINCT ON (w.w_id) \
+                    w.w_id, (n.nodeport - 7000 + 5432) AS node_port, \
+                    shard_name('warehouse'::regclass,  get_shard_id_for_distribution_column('warehouse',  w.w_id)) AS t_warehouse, \
+                    shard_name('district'::regclass,   get_shard_id_for_distribution_column('district',   w.w_id)) AS t_district, \
+                    shard_name('customer'::regclass,   get_shard_id_for_distribution_column('customer',   w.w_id)) AS t_customer, \
+                    shard_name('history'::regclass,    get_shard_id_for_distribution_column('history',    w.w_id)) AS t_history, \
+                    shard_name('stock'::regclass,      get_shard_id_for_distribution_column('stock',      w.w_id)) AS t_stock, \
+                    shard_name('orders'::regclass,     get_shard_id_for_distribution_column('orders',     w.w_id)) AS t_orders, \
+                    shard_name('new_order'::regclass,  get_shard_id_for_distribution_column('new_order',  w.w_id)) AS t_new_order, \
+                    shard_name('order_line'::regclass, get_shard_id_for_distribution_column('order_line', w.w_id)) AS t_order_line \
              FROM   generate_series(1, $count_ware) AS w(w_id) \
              JOIN   pg_dist_shard     s ON s.logicalrelid = 'warehouse'::regclass \
                                        AND get_shard_id_for_distribution_column('warehouse', w.w_id) = s.shardid \
-             JOIN   pg_dist_placement p ON p.shardid = s.shardid \
-             JOIN   pg_dist_node      n ON n.groupid = p.groupid \
-             WHERE  n.noderole = 'primary' AND n.isactive \
-             ORDER  BY node_key, w.w_id"
+             JOIN   pg_dist_placement p ON p.shardid  = s.shardid \
+             JOIN   pg_dist_node      n ON n.groupid  = p.groupid \
+                                       AND n.noderole = 'primary' \
+                                       AND n.isactive \
+             ORDER  BY w.w_id, n.nodeid"
     set result [ pg_exec $lda $sql ]
     if { [pg_result $result -status] ne "PGRES_TUPLES_OK" } {
         set err [ pg_result $result -error ]
@@ -2125,13 +2164,27 @@ proc BuildCitusPlacementMap { lda count_ware } {
     }
     array set bucket {}
     set node_order [list]
-    foreach row [ pg_result $result -list ] {
-        lassign $row w_id node_key
+    #-llist returns one sub-list per row; -list would flatten all fields into a
+    #single list which is NOT what we want here.
+    foreach row [ pg_result $result -llist ] {
+        lassign $row w_id node_port t_warehouse t_district t_customer t_history t_stock t_orders t_new_order t_order_line
+        set node_key "$host:$node_port"
         if { ![ info exists bucket($node_key) ] } {
             set bucket($node_key) [list]
             lappend node_order $node_key
         }
         lappend bucket($node_key) $w_id
+        #Per-warehouse shard-name map; workers in direct mode use these names to
+        #bypass the Citus router and write straight to the shard (1 backend, 1PC).
+        tsv::set citus_shards $w_id [list \
+            warehouse  $t_warehouse  \
+            district   $t_district   \
+            customer   $t_customer   \
+            history    $t_history    \
+            stock      $t_stock      \
+            orders     $t_orders     \
+            new_order  $t_new_order  \
+            order_line $t_order_line]
     }
     pg_result $result -clear
     set total 0
@@ -2144,7 +2197,7 @@ proc BuildCitusPlacementMap { lda count_ware } {
         lappend parts "$nk=$n"
     }
     if { $total != $count_ware } {
-        error "Citus placement map: discovered $total warehouses, expected $count_ware (check rebalance status)"
+        error "Citus placement map: discovered $total warehouses, expected $count_ware ([join $parts {, }]) (check rebalance status / pg_dist_node)"
     }
     puts "Citus placement: [llength $node_order] node(s), $count_ware warehouse(s) ([join $parts {, }])"
     return $node_order
@@ -2283,7 +2336,7 @@ proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_pass
                 #The load balancer port is intentionally NOT used here; balancing is achieved by
                 #per-node warehouse bucketing.
                 LoadItems $lda $MAXITEMS
-                BuildCitusPlacementMap $lda $count_ware
+                BuildCitusPlacementMap $lda $host $count_ware
                 tsv::set application load "READY"
             } else {
                 tsv::set application load "READY"
@@ -2378,12 +2431,21 @@ proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_pass
                 tsv::lreplace common thrdlst $myposition $myposition active
                 puts "Start:[ clock format [ clock seconds ] ]"
                 set loaded 0
+                #In direct-worker mode, write straight to per-shard tables to
+                #bypass Citus's distributed executor (originator + per-shard
+                #executor = 2 backends = mandatory 2PC). With shard-qualified
+                #names, each transaction has 1 backend and commits via 1PC.
                 while 1 {
                     set w_id [ citus_next_warehouse $my_nk ]
                     if { $w_id eq "" } { break }
-                    LoadWare $lda $w_id $w_id $MAXITEMS $DIST_PER_WARE
-                    LoadCust $lda $w_id $w_id $CUST_PER_DIST $DIST_PER_WARE $ora_compatible
-                    LoadOrd $lda $w_id $w_id $MAXITEMS $ORD_PER_DIST $DIST_PER_WARE $ora_compatible
+                    if { $citus_direct_workers eq "true" } {
+                        set tabmap [ tsv::get citus_shards $w_id ]
+                    } else {
+                        set tabmap [ citus_default_tabmap ]
+                    }
+                    LoadWare $lda $w_id $w_id $MAXITEMS $DIST_PER_WARE $tabmap
+                    LoadCust $lda $w_id $w_id $CUST_PER_DIST $DIST_PER_WARE $ora_compatible $tabmap
+                    LoadOrd $lda $w_id $w_id $MAXITEMS $ORD_PER_DIST $DIST_PER_WARE $ora_compatible $tabmap
                     set result [ pg_exec $lda "commit" ]
                     pg_result $result -clear
                     incr loaded
