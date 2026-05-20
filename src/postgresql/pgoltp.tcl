@@ -7,6 +7,11 @@ proc build_pgtpcc {} {
     upvar #0 configpostgresql configpostgresql
     #set variables to values in dict
     setlocaltpccvars $configpostgresql
+    if { $pg_num_vu eq -1 && $pg_cituscompat eq "true" } {
+        set pg_num_vu $pg_count_ware
+        dict set configpostgresql tpcc pg_num_vu $pg_num_vu
+        puts "Auto-sizing pg_num_vu for Citus build: $pg_num_vu (one worker per warehouse, +1 monitor)"
+    }
     if {[ tk_messageBox -title "Create Schema" -icon question -message "Ready to create a $pg_count_ware Warehouse PostgreSQL TPROC-C schema\nin host [string toupper $pg_host:$pg_port] sslmode [string toupper $pg_sslmode] in azure_citus [string toupper $pg_azure_citus] under user [ string toupper $pg_user ] in database [ string toupper $pg_dbase ]?" -type yesno ] == yes} {
         if { $pg_num_vu eq 1 || $pg_count_ware eq 1 } {
             set maxvuser 1

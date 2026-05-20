@@ -1173,6 +1173,17 @@ proc buildschema {} {
         set vukey [ lsearch [ join [ set $dictname ]] *num_vu ]
         set vuname [ lsearch -inline [ join [ set $dictname ]] *num_vu ]
         set buildvu [ lindex [ join [ set $dictname ]] [ expr $vukey + 1]]
+        if { $buildvu eq -1 && $rdbms eq "PostgreSQL" } {
+            set citus_enabled "false"
+            if { [ dict exists [ set $dictname ] tpcc pg_cituscompat ] } {
+                set citus_enabled [ dict get [ set $dictname ] tpcc pg_cituscompat ]
+            }
+            if { $citus_enabled eq "true" } {
+                set buildvu $buildcw
+                dict set $dictname tpcc $vuname $buildvu
+                puts "Auto-sizing virtual users for Citus build: $vuname = $buildvu (one worker per warehouse, +1 monitor)"
+            }
+        }
         if { ![string is integer -strict $buildvu ] || $buildvu < 1 || $buildvu > 1024 } {
             puts "Error: Number of virtual users to build schema must be an integer less than 1024"
             return
