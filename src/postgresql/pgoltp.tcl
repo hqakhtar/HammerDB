@@ -2131,8 +2131,11 @@ proc GetDataPort { port citus_lb_port azure_citus citus_compatible } {
 #Stores in tsv shared state:
 #   citus(nodes)        -> ordered list of node keys "host:port"
 #   citus_ware($nk)     -> list of warehouse IDs hosted on $nk
-proc BuildCitusPlacementMap { lda host count_ware } {
-    puts "Building Citus warehouse placement map for $count_ware warehouse(s)"
+#Only enqueues warehouses in [first_ware .. first_ware + count_ware - 1], so each
+#multi-runner process claims only its own slice.
+proc BuildCitusPlacementMap { lda host first_ware count_ware } {
+    set last_ware [ expr {$first_ware + $count_ware - 1} ]
+    puts "Building Citus warehouse placement map for warehouses $first_ware..$last_ware ($count_ware total)"
     #Host comes from the HammerDB connection (pg_host); the catalog's nodename is
     #ignored because on managed services (e.g. Azure Cosmos DB for PostgreSQL) the
     #internal nodename/nodeport are not reachable from external clients. We only
@@ -2148,7 +2151,7 @@ proc BuildCitusPlacementMap { lda host count_ware } {
                     shard_name('orders'::regclass,     get_shard_id_for_distribution_column('orders',     w.w_id)) AS t_orders, \
                     shard_name('new_order'::regclass,  get_shard_id_for_distribution_column('new_order',  w.w_id)) AS t_new_order, \
                     shard_name('order_line'::regclass, get_shard_id_for_distribution_column('order_line', w.w_id)) AS t_order_line \
-             FROM   generate_series(1, $count_ware) AS w(w_id) \
+             FROM   generate_series($first_ware, $last_ware) AS w(w_id) \
              JOIN   pg_dist_shard     s ON s.logicalrelid = 'warehouse'::regclass \
                                        AND get_shard_id_for_distribution_column('warehouse', w.w_id) = s.shardid \
              JOIN   pg_dist_placement p ON p.shardid  = s.shardid \
@@ -2269,12 +2272,52 @@ proc citus_next_warehouse { nk } {
     return $w_id
 }
 
-proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_password defaultdb db tspace user password ora_compatible citus_compatible pg_storedprocs partition num_vu citus_lb_port citus_direct_workers } {
+proc detect_build_phase { host port sslmode user password db count_ware } {
+    #Phase decision based on schema state plus count_ware:
+    #  user db absent / schema absent   -> "ddl"        (Phase 1)
+    #  schema present, count_ware > 0   -> "data"       (Phase 2)
+    #  schema present, count_ware == 0,
+    #    secondary indexes absent       -> "post_data"  (Phase 3)
+    #  schema present + indexes built   -> "done"
+    set has_warehouse 0
+    set has_index    0
+    #Connect as the application user to the target database; if the database
+    #doesn't exist yet, this fails and we're in DDL phase.
+    set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+    if { $lda eq "Failed" } {
+        return "ddl"
+    }
+    catch {
+        pg_select $lda "select 1 as x from pg_class where relname='warehouse'" r {
+            set has_warehouse 1
+        }
+    }
+    catch {
+        pg_select $lda "select 1 as x from pg_class where relname='customer_i2'" r {
+            set has_index 1
+        }
+    }
+    pg_disconnect $lda
+    if { !$has_warehouse }  { return "ddl" }
+    if { $count_ware > 0 }  { return "data" }
+    if { !$has_index }      { return "post_data" }
+    return "done"
+}
+
+proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_password defaultdb db tspace user password ora_compatible citus_compatible pg_storedprocs partition num_vu citus_lb_port citus_direct_workers pg_first_ware } {
     set MAXITEMS 100000
     set CUST_PER_DIST 3000
     set DIST_PER_WARE 10
     set ORD_PER_DIST 3000
-    if { $num_vu > $count_ware } { set num_vu $count_ware }
+    if { ![ string is integer -strict $pg_first_ware ] || $pg_first_ware < 1 } { set pg_first_ware 1 }
+    set ware_end [ expr {$pg_first_ware + $count_ware - 1} ]
+    #count_ware==0 is the DDL-only / post-data-only sentinel; force single-threaded
+    #so we don't spin up worker VUs that have nothing to load.
+    if { $count_ware == 0 } {
+        set num_vu 1
+    } elseif { $num_vu > $count_ware } {
+        set num_vu $count_ware
+    }
     if { $num_vu > 1 && [ chk_thread ] eq "TRUE" } {
         set threaded "MULTI-THREADED"
         set rema [ lassign [ findvuposition ] myposition totalvirtualusers ]
@@ -2291,179 +2334,143 @@ proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_pass
             }
             default { 
                 puts "Worker Thread"
-                if { [ expr $myposition - 1 ] > $count_ware } { puts "No Warehouses to Create"; return }
+                if { $count_ware <= 0 || [ expr $myposition - 1 ] > $count_ware } { puts "No Warehouses to Create"; return }
             }
         }
     } else {
         set threaded "SINGLE-THREADED"
         set num_vu 1
+        set myposition 1
+        set totalvirtualusers 1
     }
     if { $threaded eq "SINGLE-THREADED" ||  $threaded eq "MULTI-THREADED" && $myposition eq 1 } {
-        puts "CREATING [ string toupper $user ] SCHEMA"
         set schema_start_seconds [clock seconds]
-        set lda [ ConnectToPostgres $host $port $sslmode $superuser $superuser_password $defaultdb ]
-        if { $lda eq "Failed" } {
-            error "error, the database connection to $host could not be established"
-        } else {
-            CreateUserDatabase $lda $host $port $sslmode $azure_citus $db $tspace $superuser $superuser_password $user $password
-            set result [ pg_exec $lda "commit" ]
-            pg_result $result -clear
-            pg_disconnect $lda
-            set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
-            if { $lda eq "Failed" } {
-                error "error, the database connection to $host could not be established"
-            } else {
-                if { $partition eq "true" } {
-                    if {$count_ware < 200} {
-                        set num_part 0
-                    } else {
-                        set num_part [ expr round($count_ware/100) ]
-                    }
-                } else {
-                    set num_part 0
+        set phase [ detect_build_phase $host $port $sslmode $user $password $db $count_ware ]
+        puts "Build phase: $phase  (pg_first_ware=$pg_first_ware pg_count_ware=$count_ware ware_end=$ware_end)"
+        if { $phase eq "done" } {
+            puts "[ string toupper $user ] SCHEMA already complete; nothing to do."
+            return
+        }
+        set ddl_elapsed 0
+        set data_load_elapsed 0
+        set index_elapsed 0
+        set sproc_elapsed 0
+        set did_ddl 0
+        set lda ""
+        # ---- PHASE 1: DDL (CreateUserDatabase + CreateTables + LoadItems) ----
+        if { $phase eq "ddl" } {
+            if { $pg_first_ware != 1 } {
+                error "Phase 1 (DDL) requires PG_FIRST_WARE=1 (got $pg_first_ware)"
+            }
+            set did_ddl 1
+            puts "CREATING [ string toupper $user ] SCHEMA"
+            if { $azure_citus eq "true" } {
+                #Azure Elastic Cluster: only the pre-existing 'postgres' database is
+                #available, the cluster admin role cannot be altered via SQL, and there
+                #is no CREATE/ALTER/DROP DATABASE. Skip CreateUserDatabase entirely and
+                #connect straight to the target database as the application user.
+                puts "Azure Citus (Azure Elastic Cluster) mode: skipping CreateUserDatabase; assuming database $db and role $user already exist with required privileges"
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established (db=$db user=$user)"
                 }
-                CreateTables $lda $ora_compatible $citus_compatible $num_part
+            } else {
+                set lda [ ConnectToPostgres $host $port $sslmode $superuser $superuser_password $defaultdb ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established"
+                }
+                CreateUserDatabase $lda $host $port $sslmode $azure_citus $db $tspace $superuser $superuser_password $user $password
                 set result [ pg_exec $lda "commit" ]
                 pg_result $result -clear
+                pg_disconnect $lda
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established"
+                }
             }
-        }
-        set ddl_elapsed [expr {[clock seconds] - $schema_start_seconds}]
-        puts "DDL phase (create tables) completed in $ddl_elapsed seconds"
-        if { $threaded eq "MULTI-THREADED" } {
-            set data_load_start [clock seconds]
-            if { $citus_compatible eq "true" } {
-                #Citus build path: load reference table via coordinator, then publish placement map.
-                #The load balancer port is intentionally NOT used here; balancing is achieved by
-                #per-node warehouse bucketing.
-                LoadItems $lda $MAXITEMS
-                BuildCitusPlacementMap $lda $host $count_ware
-                tsv::set application load "READY"
+            if { $partition eq "true" } {
+                if {$count_ware < 200} {
+                    set num_part 0
+                } else {
+                    set num_part [ expr round($count_ware/100) ]
+                }
             } else {
-                tsv::set application load "READY"
+                set num_part 0
+            }
+            CreateTables $lda $ora_compatible $citus_compatible $num_part
+            set result [ pg_exec $lda "commit" ]
+            pg_result $result -clear
+            set ddl_elapsed [expr {[clock seconds] - $schema_start_seconds}]
+            puts "DDL phase (create tables) completed in $ddl_elapsed seconds"
+            #Items (reference table) load happens here, exactly once.
+            set items_start [clock seconds]
+            if { $citus_compatible eq "true" } {
+                LoadItems $lda $MAXITEMS
+            } else {
                 set data_port [GetDataPort $port $citus_lb_port $azure_citus $citus_compatible]
                 if { $data_port ne $port } {
-                    puts "Using load balancer port $data_port for data population"
+                    puts "Using load balancer port $data_port for items load"
                     set lda_data [ ConnectToPostgres $host $data_port $sslmode $user $password $db ]
                     if { $lda_data eq "Failed" } {
                         error "error, the load balancer connection to $host:$data_port could not be established"
                     }
-                } else {
-                    set lda_data $lda
-                }
-                LoadItems $lda_data $MAXITEMS
-                if { $data_port ne $port } {
+                    LoadItems $lda_data $MAXITEMS
                     pg_disconnect $lda_data
-                }
-            }
-            puts "Monitoring Workers..."
-            set prevactive 0
-            while 1 {
-                set idlcnt 0; set lvcnt 0; set dncnt 0;
-                for {set th 2} {$th <= $totalvirtualusers } {incr th} {
-                    switch [tsv::lindex common thrdlst $th] {
-                        idle { incr idlcnt }
-                        active { incr lvcnt }
-                        done { incr dncnt }
-                    }
-                }
-                if { $lvcnt != $prevactive } {
-                    puts "Workers: $lvcnt Active $dncnt Done"
-                }
-                set prevactive $lvcnt
-                if { $dncnt eq [expr  $totalvirtualusers - 1] } { break }
-                after 10000
-            }
-            set data_load_elapsed [expr {[clock seconds] - $data_load_start}]
-            puts "Data population completed in $data_load_elapsed seconds"
-        } else {
-            set data_load_start [clock seconds]
-            LoadItems $lda $MAXITEMS
-            set data_load_elapsed [expr {[clock seconds] - $data_load_start}]
-            puts "Data population completed in $data_load_elapsed seconds"
-        }
-    }
-    if { $threaded eq "SINGLE-THREADED" ||  $threaded eq "MULTI-THREADED" && $myposition != 1 } {
-        if { $threaded eq "MULTI-THREADED" } {
-            puts "Waiting for Monitor Thread..."
-            set mtcnt 0
-            while 1 { 
-                if { [ tsv::exists application load ] } {
-                    incr mtcnt
-                    if {  [ tsv::get application load ] eq "READY" } { break }
-                    if {  [ tsv::get application abort ]  } { return }
-                    if { $mtcnt eq 48 } { 
-                        puts "Monitor failed to notify ready state" 
-                        return
-                    }
-                }
-                after 5000 
-            }
-            if { $citus_compatible eq "true" } {
-                #Citus placement-aware build path.
-                set citus_nodes [ tsv::get citus nodes ]
-                set nworkers [ expr {$totalvirtualusers - 1} ]
-                set vu_to_node [ distribute_citus_workers $citus_nodes $nworkers ]
-                set vu_idx [ expr {$myposition - 2} ]
-                if { $vu_idx >= [ llength $vu_to_node ] } {
-                    puts "Worker $myposition: no warehouses to load (excess VU); exiting"
-                    tsv::lreplace common thrdlst $myposition $myposition done
-                    return
-                }
-                set my_nk [ lindex $vu_to_node $vu_idx ]
-                if { $citus_direct_workers eq "true" } {
-                    lassign [ split $my_nk ":" ] my_host my_port
-                    puts "Worker $myposition: assigned to node $my_nk (direct connection)"
-                    set lda [ ConnectToPostgres $my_host $my_port $sslmode $user $password $db ]
-                    if { $lda eq "Failed" } {
-                        puts "Worker $myposition: direct connection to $my_nk failed, falling back to coordinator $host:$port"
-                        set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
-                        if { $lda eq "Failed" } {
-                            error "error, the database connection to $host could not be established"
-                        }
-                    }
                 } else {
-                    puts "Worker $myposition: assigned to node $my_nk (via coordinator $host:$port)"
-                    set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
-                    if { $lda eq "Failed" } {
-                        error "error, the database connection to $host could not be established"
-                    }
+                    LoadItems $lda $MAXITEMS
                 }
-                tsv::lreplace common thrdlst $myposition $myposition active
-                puts "Start:[ clock format [ clock seconds ] ]"
-                set loaded 0
-                #In direct-worker mode, write straight to per-shard tables to
-                #bypass Citus's distributed executor (originator + per-shard
-                #executor = 2 backends = mandatory 2PC). With shard-qualified
-                #names, each transaction has 1 backend and commits via 1PC.
-                while 1 {
-                    set w_id [ citus_next_warehouse $my_nk ]
-                    if { $w_id eq "" } { break }
-                    if { $citus_direct_workers eq "true" } {
-                        set tabmap [ tsv::get citus_shards $w_id ]
-                    } else {
-                        set tabmap [ citus_default_tabmap ]
-                    }
-                    LoadWare $lda $w_id $w_id $MAXITEMS $DIST_PER_WARE $tabmap
-                    LoadCust $lda $w_id $w_id $CUST_PER_DIST $DIST_PER_WARE $ora_compatible $tabmap
-                    LoadOrd $lda $w_id $w_id $MAXITEMS $ORD_PER_DIST $DIST_PER_WARE $ora_compatible $tabmap
-                    set result [ pg_exec $lda "commit" ]
-                    pg_result $result -clear
-                    incr loaded
-                }
-                puts "End:[ clock format [ clock seconds ] ]  Worker $myposition loaded $loaded warehouse(s) from $my_nk"
-                tsv::lreplace common thrdlst $myposition $myposition done
+            }
+            puts "Items load completed in [expr {[clock seconds] - $items_start}] seconds"
+            #Fall through to data only when there are warehouses to load in this process.
+            if { $count_ware > 0 } {
+                set phase "data"
             } else {
-                set data_port [GetDataPort $port $citus_lb_port $azure_citus $citus_compatible]
-                if { $data_port ne $port } {
-                    puts "Worker $myposition: connecting via load balancer port $data_port"
-                }
-                set lda [ ConnectToPostgres $host $data_port $sslmode $user $password $db ]
+                puts "Phase 1 (DDL + items) complete; exiting."
+                pg_disconnect $lda
+                return
+            }
+        }
+        # ---- PHASE 2: DATA (warehouse rows) ----
+        if { $phase eq "data" } {
+            if { $lda eq "" } {
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
                 if { $lda eq "Failed" } {
                     error "error, the database connection to $host could not be established"
                 }
-                set remb [ lassign [ findchunk $num_vu $count_ware $myposition ] chunk mystart myend ]
-                puts "Loading $chunk Warehouses start:$mystart end:$myend"
-                tsv::lreplace common thrdlst $myposition $myposition active
+            }
+            set data_load_start [clock seconds]
+            if { $threaded eq "MULTI-THREADED" } {
+                if { $citus_compatible eq "true" } {
+                    #Citus build path: publish placement map for this runner's slice only.
+                    #The load balancer port is intentionally NOT used here; balancing is achieved
+                    #by per-node warehouse bucketing.
+                    BuildCitusPlacementMap $lda $host $pg_first_ware $count_ware
+                }
+                tsv::set application load "READY"
+                puts "Monitoring Workers..."
+                set prevactive 0
+                while 1 {
+                    set idlcnt 0; set lvcnt 0; set dncnt 0;
+                    for {set th 2} {$th <= $totalvirtualusers } {incr th} {
+                        switch [tsv::lindex common thrdlst $th] {
+                            idle { incr idlcnt }
+                            active { incr lvcnt }
+                            done { incr dncnt }
+                        }
+                    }
+                    if { $lvcnt != $prevactive } {
+                        puts "Workers: $lvcnt Active $dncnt Done"
+                    }
+                    set prevactive $lvcnt
+                    if { $dncnt eq [expr  $totalvirtualusers - 1] } { break }
+                    after 10000
+                }
+                set data_load_elapsed [expr {[clock seconds] - $data_load_start}]
+                puts "Data population completed in $data_load_elapsed seconds"
+            } else {
+                #Single-threaded data load (legacy single-process build).
+                set mystart $pg_first_ware
+                set myend $ware_end
                 puts "Start:[ clock format [ clock seconds ] ]"
                 LoadWare $lda $mystart $myend $MAXITEMS $DIST_PER_WARE
                 LoadCust $lda $mystart $myend $CUST_PER_DIST $DIST_PER_WARE $ora_compatible
@@ -2471,11 +2478,127 @@ proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_pass
                 puts "End:[ clock format [ clock seconds ] ]"
                 set result [ pg_exec $lda "commit" ]
                 pg_result $result -clear
-                tsv::lreplace common thrdlst $myposition $myposition done
+                set data_load_elapsed [expr {[clock seconds] - $data_load_start}]
+                puts "Data population completed in $data_load_elapsed seconds"
             }
+            #Fall through to post-data only for single-process full builds; multi-runner
+            #Phase-2 invocations stop here and let the pilot orchestrate Phase 3.
+            if { $did_ddl || $threaded eq "SINGLE-THREADED" } {
+                set phase "post_data"
+            } else {
+                pg_disconnect $lda
+                return
+            }
+        }
+        # ---- PHASE 3: POST-DATA (indexes + stored procs + stats) ----
+        if { $phase eq "post_data" } {
+            if { $lda eq "" } {
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established"
+                }
+            }
+            set index_start [clock seconds]
+            CreateIndexes $lda
+            set index_elapsed [expr {[clock seconds] - $index_start}]
+            puts "Index creation completed in $index_elapsed seconds"
+            set sproc_start [clock seconds]
+            CreateStoredProcs $lda $ora_compatible $citus_compatible $pg_storedprocs
+            set sproc_elapsed [expr {[clock seconds] - $sproc_start}]
+            puts "Stored procedures creation completed in $sproc_elapsed seconds"
+            GatherStatistics $lda
+            set total_elapsed [expr {[clock seconds] - $schema_start_seconds}]
+            puts "Schema build total: $total_elapsed seconds (DDL: ${ddl_elapsed}s, Data: ${data_load_elapsed}s, Index: ${index_elapsed}s, StoredProcs: ${sproc_elapsed}s)"
+            puts "[ string toupper $user ] SCHEMA COMPLETE"
+            pg_disconnect $lda
+            return
+        }
+        pg_disconnect $lda
+        return
+    }
+    if { $threaded eq "MULTI-THREADED" && $myposition != 1 } {
+        puts "Waiting for Monitor Thread..."
+        set mtcnt 0
+        while 1 { 
+            if { [ tsv::exists application load ] } {
+                incr mtcnt
+                if {  [ tsv::get application load ] eq "READY" } { break }
+                if {  [ tsv::get application abort ]  } { return }
+                if { $mtcnt eq 48 } { 
+                    puts "Monitor failed to notify ready state" 
+                    return
+                }
+            }
+            after 5000 
+        }
+        if { $citus_compatible eq "true" } {
+            #Citus placement-aware build path.
+            set citus_nodes [ tsv::get citus nodes ]
+            set nworkers [ expr {$totalvirtualusers - 1} ]
+            set vu_to_node [ distribute_citus_workers $citus_nodes $nworkers ]
+            set vu_idx [ expr {$myposition - 2} ]
+            if { $vu_idx >= [ llength $vu_to_node ] } {
+                puts "Worker $myposition: no warehouses to load (excess VU); exiting"
+                tsv::lreplace common thrdlst $myposition $myposition done
+                return
+            }
+            set my_nk [ lindex $vu_to_node $vu_idx ]
+            if { $citus_direct_workers eq "true" } {
+                lassign [ split $my_nk ":" ] my_host my_port
+                puts "Worker $myposition: assigned to node $my_nk (direct connection)"
+                set lda [ ConnectToPostgres $my_host $my_port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    puts "Worker $myposition: direct connection to $my_nk failed, falling back to coordinator $host:$port"
+                    set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                    if { $lda eq "Failed" } {
+                        error "error, the database connection to $host could not be established"
+                    }
+                }
+            } else {
+                puts "Worker $myposition: assigned to node $my_nk (via coordinator $host:$port)"
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established"
+                }
+            }
+            tsv::lreplace common thrdlst $myposition $myposition active
+            puts "Start:[ clock format [ clock seconds ] ]"
+            set loaded 0
+            #In direct-worker mode, write straight to per-shard tables to
+            #bypass Citus's distributed executor (originator + per-shard
+            #executor = 2 backends = mandatory 2PC). With shard-qualified
+            #names, each transaction has 1 backend and commits via 1PC.
+            while 1 {
+                set w_id [ citus_next_warehouse $my_nk ]
+                if { $w_id eq "" } { break }
+                if { $citus_direct_workers eq "true" } {
+                    set tabmap [ tsv::get citus_shards $w_id ]
+                } else {
+                    set tabmap [ citus_default_tabmap ]
+                }
+                LoadWare $lda $w_id $w_id $MAXITEMS $DIST_PER_WARE $tabmap
+                LoadCust $lda $w_id $w_id $CUST_PER_DIST $DIST_PER_WARE $ora_compatible $tabmap
+                LoadOrd $lda $w_id $w_id $MAXITEMS $ORD_PER_DIST $DIST_PER_WARE $ora_compatible $tabmap
+                set result [ pg_exec $lda "commit" ]
+                pg_result $result -clear
+                incr loaded
+            }
+            puts "End:[ clock format [ clock seconds ] ]  Worker $myposition loaded $loaded warehouse(s) from $my_nk"
+            tsv::lreplace common thrdlst $myposition $myposition done
         } else {
-            set mystart 1
-            set myend $count_ware
+            set data_port [GetDataPort $port $citus_lb_port $azure_citus $citus_compatible]
+            if { $data_port ne $port } {
+                puts "Worker $myposition: connecting via load balancer port $data_port"
+            }
+            set lda [ ConnectToPostgres $host $data_port $sslmode $user $password $db ]
+            if { $lda eq "Failed" } {
+                error "error, the database connection to $host could not be established"
+            }
+            set remb [ lassign [ findchunk $num_vu $count_ware $myposition ] chunk mystart myend ]
+            incr mystart [ expr {$pg_first_ware - 1} ]
+            incr myend   [ expr {$pg_first_ware - 1} ]
+            puts "Loading $chunk Warehouses start:$mystart end:$myend"
+            tsv::lreplace common thrdlst $myposition $myposition active
             puts "Start:[ clock format [ clock seconds ] ]"
             LoadWare $lda $mystart $myend $MAXITEMS $DIST_PER_WARE
             LoadCust $lda $mystart $myend $CUST_PER_DIST $DIST_PER_WARE $ora_compatible
@@ -2483,27 +2606,12 @@ proc do_tpcc { host port sslmode azure_citus count_ware superuser superuser_pass
             puts "End:[ clock format [ clock seconds ] ]"
             set result [ pg_exec $lda "commit" ]
             pg_result $result -clear
+            tsv::lreplace common thrdlst $myposition $myposition done
         }
     }
-    if { $threaded eq "SINGLE-THREADED" || $threaded eq "MULTI-THREADED" && $myposition eq 1 } {
-        set index_start [clock seconds]
-        CreateIndexes $lda
-        set index_elapsed [expr {[clock seconds] - $index_start}]
-        puts "Index creation completed in $index_elapsed seconds"
-        set sproc_start [clock seconds]
-        CreateStoredProcs $lda $ora_compatible $citus_compatible $pg_storedprocs
-        set sproc_elapsed [expr {[clock seconds] - $sproc_start}]
-        puts "Stored procedures creation completed in $sproc_elapsed seconds"
-        GatherStatistics $lda
-        set total_elapsed [expr {[clock seconds] - $schema_start_seconds}]
-        puts "Schema build total: $total_elapsed seconds (DDL: ${ddl_elapsed}s, Data: ${data_load_elapsed}s, Index: ${index_elapsed}s, StoredProcs: ${sproc_elapsed}s)"
-        puts "[ string toupper $user ] SCHEMA COMPLETE"
-        pg_disconnect $lda
-        return
-    }
 }
 }
-        .ed_mainFrame.mainwin.textFrame.left.text fastinsert end "do_tpcc $pg_host $pg_port $pg_sslmode $pg_azure_citus $pg_count_ware $pg_superuser [ quotemeta $pg_superuserpass ] $pg_defaultdbase $pg_dbase $pg_tspace $pg_user [ quotemeta $pg_pass ] $pg_oracompat $pg_cituscompat $pg_storedprocs $pg_partition $pg_num_vu $pg_citus_loadbalancer $pg_citus_direct_workers"
+        .ed_mainFrame.mainwin.textFrame.left.text fastinsert end "do_tpcc $pg_host $pg_port $pg_sslmode $pg_azure_citus $pg_count_ware $pg_superuser [ quotemeta $pg_superuserpass ] $pg_defaultdbase $pg_dbase $pg_tspace $pg_user [ quotemeta $pg_pass ] $pg_oracompat $pg_cituscompat $pg_storedprocs $pg_partition $pg_num_vu $pg_citus_loadbalancer $pg_citus_direct_workers $pg_first_ware"
     } else { return }
 }
 
