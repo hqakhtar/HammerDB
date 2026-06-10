@@ -671,7 +671,7 @@ proc configpgtpcc {option} {
         }
         "default" {
             ttk::button $Name -command {
-                set pg_count_ware [ verify_warehouse $pg_count_ware 100000 ]
+                set pg_count_ware [ verify_warehouse $pg_count_ware 20000000 ]
                 set pg_num_vu [ verify_build_threads $pg_num_vu $pg_count_ware ]
                 copyfieldstoconfig configpostgresql [ subst $pgfields ] tpcc
                 Dict2SQLite "postgresql" $configpostgresql
