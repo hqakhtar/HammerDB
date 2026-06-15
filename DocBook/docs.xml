@@ -4301,6 +4301,21 @@ GO
                 </row>
 
                 <row>
+                  <entry>First Warehouse Number</entry>
+
+                  <entry>The first warehouse ID this HammerDB process will
+                  load. Together with the Number of Warehouses it defines
+                  the warehouse range loaded by this process. The default is
+                  1 which gives the standard single-process build of
+                  warehouses 1 to N. A higher value lets multiple HammerDB
+                  processes load different slices of the same schema in
+                  parallel and is described in the Parallel Multi-Process
+                  Schema Build section below. The First Warehouse Number
+                  must be set to 1 when the database and tables are being
+                  created.</entry>
+                </row>
+
+                <row>
                   <entry>Virtual Users to Build Schema</entry>
 
                   <entry>The Virtual Users to Build Schema is the number of
@@ -4391,6 +4406,165 @@ GO
           </imageobject>
         </mediaobject>
       </figure>
+    </section>
+
+    <section>
+      <title>Parallel Multi-Process Schema Build</title>
+
+      <para>For very large PostgreSQL TPROC-C schemas the schema build can
+      be split across several HammerDB processes that load disjoint
+      warehouse ranges into the same database in parallel. Each process is a
+      normal HammerDB build run using a different First Warehouse Number and
+      Number of Warehouses combination so that the warehouse ranges do not
+      overlap.</para>
+
+      <para>Each process automatically picks one of three phases by
+      inspecting the target database. The first process to run finds an
+      empty database and runs the DDL phase which creates the user, the
+      database, the tables and loads the item reference table. The DDL phase
+      requires First Warehouse Number to be 1 and only runs once. Each
+      subsequent process finds the schema already in place and runs the data
+      phase which populates the warehouse, district, customer, history,
+      order and stock rows for its own warehouse slice using the configured
+      number of Virtual Users. After every process has finished loading its
+      data a final process is run with Number of Warehouses set to 0 which
+      triggers the post-data phase to create the indexes and stored
+      procedures and gather statistics.</para>
+
+      <para>A typical four-process build of 1000 warehouses uses Process 1
+      with First Warehouse Number 1 and Number of Warehouses 250, Process 2
+      with First Warehouse Number 251 and Number of Warehouses 250, Process
+      3 with First Warehouse Number 501 and Number of Warehouses 250 and
+      Process 4 with First Warehouse Number 751 and Number of Warehouses
+      250. Process 1 must complete its DDL phase before the others are
+      started so that they find the schema already in place. Once all four
+      have completed a final process with First Warehouse Number 1 and
+      Number of Warehouses 0 is run to complete the post-data phase.</para>
+
+      <para>A re-run of any process will detect that its phase has already
+      completed and exit without doing any work which makes the build safe
+      to resume after a failure. For a conventional single-process build
+      leave First Warehouse Number as 1 and the build will run all three
+      phases in one invocation exactly as in earlier releases.</para>
+
+      <para>When using scripts the Build Phase setting can be forced with
+      pg_build_phase. Valid values are auto, ddl, data and post_data. The
+      auto value keeps the schema-state detection behavior, while explicit
+      phases make multi-process orchestration easier to understand and run
+      from CI pipelines.</para>
+
+      <para>The following values are required for each explicit phase:</para>
+
+      <itemizedlist>
+        <listitem>
+          <para>ddl requires First Warehouse Number = 1.</para>
+        </listitem>
+
+        <listitem>
+          <para>data requires Number of Warehouses greater than 0.</para>
+        </listitem>
+
+        <listitem>
+          <para>post_data requires Number of Warehouses = 0.</para>
+        </listitem>
+
+        <listitem>
+          <para>Warehouse ranges for data loaders must not overlap.</para>
+        </listitem>
+      </itemizedlist>
+
+      <para>Example command sequence for a 1000 warehouse build with 4
+      parallel data loaders:</para>
+
+      <programlisting>./hammerdbcli auto pg_ddl.tcl
+
+./hammerdbcli auto pg_data_a.tcl &gt; data_a.log 2&gt;&amp;1 &amp;
+P1=$!
+./hammerdbcli auto pg_data_b.tcl &gt; data_b.log 2&gt;&amp;1 &amp;
+P2=$!
+./hammerdbcli auto pg_data_c.tcl &gt; data_c.log 2&gt;&amp;1 &amp;
+P3=$!
+./hammerdbcli auto pg_data_d.tcl &gt; data_d.log 2&gt;&amp;1 &amp;
+P4=$!
+wait $P1 $P2 $P3 $P4
+
+./hammerdbcli auto pg_post.tcl</programlisting>
+
+      <para>In this example pg_data_a.tcl uses First Warehouse Number 1 and
+      Number of Warehouses 250, pg_data_b.tcl uses 251 and 250,
+      pg_data_c.tcl uses 501 and 250 and pg_data_d.tcl uses 751 and 250.
+      The pg_ddl.tcl script uses Build Phase = ddl with Number of
+      Warehouses = 0, and pg_post.tcl uses Build Phase = post_data with
+      Number of Warehouses = 0.</para>
+
+      <para>Example script for the ddl phase:</para>
+
+      <programlisting>dbset db pg
+    dbset bm TPC-C
+
+    diset connection pg_host localhost
+    diset connection pg_port 5432
+    diset connection pg_sslmode prefer
+
+    diset tpcc pg_superuser postgres
+    diset tpcc pg_superuserpass postgres
+    diset tpcc pg_defaultdbase postgres
+    diset tpcc pg_user tpcc
+    diset tpcc pg_pass tpcc
+    diset tpcc pg_dbase tpcc
+
+    diset tpcc pg_first_ware 1
+    diset tpcc pg_count_ware 0
+    diset tpcc pg_build_phase ddl
+    diset tpcc pg_num_vu 1
+
+    buildschema</programlisting>
+
+      <para>Example script for the data phase:</para>
+
+      <programlisting>dbset db pg
+    dbset bm TPC-C
+
+    diset connection pg_host localhost
+    diset connection pg_port 5432
+    diset connection pg_sslmode prefer
+
+    diset tpcc pg_superuser postgres
+    diset tpcc pg_superuserpass postgres
+    diset tpcc pg_defaultdbase postgres
+    diset tpcc pg_user tpcc
+    diset tpcc pg_pass tpcc
+    diset tpcc pg_dbase tpcc
+
+    diset tpcc pg_first_ware 251
+    diset tpcc pg_count_ware 250
+    diset tpcc pg_build_phase data
+    diset tpcc pg_num_vu 40
+
+    buildschema</programlisting>
+
+      <para>Example script for the post_data phase:</para>
+
+      <programlisting>dbset db pg
+    dbset bm TPC-C
+
+    diset connection pg_host localhost
+    diset connection pg_port 5432
+    diset connection pg_sslmode prefer
+
+    diset tpcc pg_superuser postgres
+    diset tpcc pg_superuserpass postgres
+    diset tpcc pg_defaultdbase postgres
+    diset tpcc pg_user tpcc
+    diset tpcc pg_pass tpcc
+    diset tpcc pg_dbase tpcc
+
+    diset tpcc pg_first_ware 1
+    diset tpcc pg_count_ware 0
+    diset tpcc pg_build_phase post_data
+    diset tpcc pg_num_vu 1
+
+    buildschema</programlisting>
     </section>
 
     <section>
