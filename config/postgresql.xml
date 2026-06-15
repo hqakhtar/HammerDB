@@ -8,6 +8,8 @@
 	<tpcc>
         <schema>
             <pg_count_ware>1</pg_count_ware>
+            <pg_first_ware>1</pg_first_ware>
+            <pg_build_phase>auto</pg_build_phase>
             <pg_num_vu>1</pg_num_vu>
             <pg_superuser>postgres</pg_superuser>
             <pg_superuserpass>postgres</pg_superuserpass>

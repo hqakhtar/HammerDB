@@ -7,6 +7,9 @@ proc build_pgtpcc {} {
     upvar #0 configpostgresql configpostgresql
     #set variables to values in dict
     setlocaltpccvars $configpostgresql
+    if { ![ info exists pg_build_phase ] || $pg_build_phase eq "" } {
+        set pg_build_phase "auto"
+    }
     if {[ tk_messageBox -title "Create Schema" -icon question -message "Ready to create a $pg_count_ware Warehouse PostgreSQL TPROC-C schema\nin host [string toupper $pg_host:$pg_port] sslmode [string toupper $pg_sslmode] under user [ string toupper $pg_user ] in database [ string toupper $pg_dbase ]?" -type yesno ] == yes} {
         if { $pg_num_vu eq 1 || $pg_count_ware eq 1 } {
             set maxvuser 1
@@ -2132,12 +2135,59 @@ proc LoadOrd { lda ware_start count_ware MAXITEMS ORD_PER_DIST DIST_PER_WARE ora
     pg_result $result -clear
     return
 }
-proc do_tpcc { host port sslmode count_ware superuser superuser_password defaultdb db tspace user password ora_compatible citus_compatible pg_storedprocs partition num_vu } {
+proc detect_build_phase { host port sslmode user password db count_ware } {
+    #Phase decision based on schema state plus count_ware:
+    #  user db absent / schema absent   -> "ddl"        (Phase 1)
+    #  schema present, count_ware > 0   -> "data"       (Phase 2)
+    #  schema present, count_ware == 0,
+    #    secondary indexes absent       -> "post_data"  (Phase 3)
+    #  schema present + indexes built   -> "done"
+    set has_warehouse 0
+    set has_index    0
+    set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+    if { $lda eq "Failed" } {
+        return "ddl"
+    }
+    catch {
+        pg_select $lda "select 1 as x from pg_class where relname='warehouse'" r {
+            set has_warehouse 1
+        }
+    }
+    catch {
+        pg_select $lda "select 1 as x from pg_class where relname='customer_i2'" r {
+            set has_index 1
+        }
+    }
+    pg_disconnect $lda
+    if { !$has_warehouse }  { return "ddl" }
+    if { $count_ware > 0 }  { return "data" }
+    if { !$has_index }      { return "post_data" }
+    return "done"
+}
+
+proc do_tpcc { host port sslmode count_ware superuser superuser_password defaultdb db tspace user password ora_compatible citus_compatible pg_storedprocs partition num_vu pg_first_ware pg_build_phase } {
     set MAXITEMS 100000
     set CUST_PER_DIST 3000
     set DIST_PER_WARE 10
     set ORD_PER_DIST 3000
-    if { $num_vu > $count_ware } { set num_vu $count_ware }
+    set phase_mode [ string tolower [ string trim $pg_build_phase ] ]
+    if { $phase_mode eq "" } { set phase_mode "auto" }
+    set phase_mode [ string map {"-" "_"} $phase_mode ]
+    if { $phase_mode eq "postdata" } { set phase_mode "post_data" }
+    if { $phase_mode ni {auto ddl data post_data} } {
+        error "error, invalid pg_build_phase=$pg_build_phase (valid values: auto, ddl, data, post_data)"
+    }
+    if { ![ string is integer -strict $pg_first_ware ] || $pg_first_ware < 1 } { set pg_first_ware 1 }
+    if { $count_ware > 0 && $pg_first_ware > $count_ware } {
+        error "error, pg_first_ware ($pg_first_ware) cannot exceed pg_count_ware ($count_ware)"
+    }
+    set ware_end [ expr {$pg_first_ware + $count_ware - 1} ]
+    #count_ware==0 means no data workers are needed.
+    if { $count_ware == 0 } {
+        set num_vu 1
+    } elseif { $num_vu > $count_ware } {
+        set num_vu $count_ware
+    }
     if { $num_vu > 1 && [ chk_thread ] eq "TRUE" } {
         set threaded "MULTI-THREADED"
         set rema [ lassign [ findvuposition ] myposition totalvirtualusers ]
@@ -2154,19 +2204,51 @@ proc do_tpcc { host port sslmode count_ware superuser superuser_password default
             }
             default { 
                 puts "Worker Thread"
-                if { [ expr $myposition - 1 ] > $count_ware } { puts "No Warehouses to Create"; return }
+                if { $count_ware <= 0 || [ expr $myposition - 1 ] > $count_ware } { puts "No Warehouses to Create"; return }
             }
         }
     } else {
         set threaded "SINGLE-THREADED"
         set num_vu 1
+        set myposition 1
+        set totalvirtualusers 1
     }
     if { $threaded eq "SINGLE-THREADED" ||  $threaded eq "MULTI-THREADED" && $myposition eq 1 } {
-        puts "CREATING [ string toupper $user ] SCHEMA"
-        set lda [ ConnectToPostgres $host $port $sslmode $superuser $superuser_password $defaultdb ]
-        if { $lda eq "Failed" } {
-            error "error, the database connection to $host could not be established"
+        set schema_start_seconds [clock seconds]
+        set forced_phase [ expr {$phase_mode ne "auto"} ]
+        if { $phase_mode eq "auto" } {
+            set phase [ detect_build_phase $host $port $sslmode $user $password $db $count_ware ]
         } else {
+            set phase $phase_mode
+        }
+        puts "Build phase: $phase  (mode=$phase_mode pg_first_ware=$pg_first_ware pg_count_ware=$count_ware ware_end=$ware_end)"
+        if { $phase eq "ddl" && $pg_first_ware != 1 } {
+            error "Phase 1 (DDL) requires PG_FIRST_WARE=1 (got $pg_first_ware)"
+        }
+        if { $phase eq "data" && $count_ware <= 0 } {
+            error "Phase 2 (DATA) requires PG_COUNT_WARE > 0 (got $count_ware)"
+        }
+        if { $phase eq "post_data" && $count_ware != 0 } {
+            error "Phase 3 (POST_DATA) requires PG_COUNT_WARE=0 (got $count_ware)"
+        }
+        if { $phase eq "done" } {
+            puts "[ string toupper $user ] SCHEMA already complete; nothing to do."
+            return
+        }
+        set ddl_elapsed 0
+        set data_load_elapsed 0
+        set index_elapsed 0
+        set sproc_elapsed 0
+        set did_ddl 0
+        set lda ""
+        # ---- PHASE 1: DDL (CreateUserDatabase + CreateTables + LoadItems) ----
+        if { $phase eq "ddl" } {
+            set did_ddl 1
+            puts "CREATING [ string toupper $user ] SCHEMA"
+            set lda [ ConnectToPostgres $host $port $sslmode $superuser $superuser_password $defaultdb ]
+            if { $lda eq "Failed" } {
+                error "error, the database connection to $host could not be established"
+            }
             CreateUserDatabase $lda $host $port $sslmode $db $tspace $superuser $superuser_password $user $password
             set result [ pg_exec $lda "commit" ]
             pg_result $result -clear
@@ -2174,73 +2256,148 @@ proc do_tpcc { host port sslmode count_ware superuser superuser_password default
             set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
             if { $lda eq "Failed" } {
                 error "error, the database connection to $host could not be established"
-            } else {
-                if { $partition eq "true" } {
-                    if {$count_ware < 200} {
-                        set num_part 0
-                    } else {
-                        set num_part [ expr round($count_ware/100) ]
-                    }
-                } else {
+            }
+            if { $partition eq "true" } {
+                if {$count_ware < 200} {
                     set num_part 0
+                } else {
+                    set num_part [ expr round($count_ware/100) ]
                 }
-                CreateTables $lda $ora_compatible $citus_compatible $num_part
+            } else {
+                set num_part 0
+            }
+            CreateTables $lda $ora_compatible $citus_compatible $num_part
+            set result [ pg_exec $lda "commit" ]
+            pg_result $result -clear
+            set ddl_elapsed [expr {[clock seconds] - $schema_start_seconds}]
+            puts "DDL phase (create tables) completed in $ddl_elapsed seconds"
+            #Items (reference table) load happens here, exactly once.
+            set items_start [clock seconds]
+            LoadItems $lda $MAXITEMS
+            puts "Items load completed in [expr {[clock seconds] - $items_start}] seconds"
+            #In explicit ddl mode stop here; in auto mode continue as before.
+            if { $forced_phase } {
+                puts "Phase 1 (DDL + items) complete."
+                pg_disconnect $lda
+                return
+            }
+            #Fall through to data only when there are warehouses to load in this process.
+            if { $count_ware > 0 } {
+                set phase "data"
+            } else {
+                puts "Phase 1 (DDL + items) complete; exiting."
+                pg_disconnect $lda
+                return
+            }
+        }
+        # ---- PHASE 2: DATA (warehouse rows) ----
+        if { $phase eq "data" } {
+            if { $lda eq "" } {
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established"
+                }
+            }
+            set data_load_start [clock seconds]
+            if { $threaded eq "MULTI-THREADED" } {
+                tsv::set application load "READY"
+                puts "Monitoring Workers..."
+                set prevactive 0
+                while 1 {
+                    set idlcnt 0; set lvcnt 0; set dncnt 0;
+                    for {set th 2} {$th <= $totalvirtualusers } {incr th} {
+                        switch [tsv::lindex common thrdlst $th] {
+                            idle { incr idlcnt }
+                            active { incr lvcnt }
+                            done { incr dncnt }
+                        }
+                    }
+                    if { $lvcnt != $prevactive } {
+                        puts "Workers: $lvcnt Active $dncnt Done"
+                    }
+                    set prevactive $lvcnt
+                    if { $dncnt eq [expr  $totalvirtualusers - 1] } { break }
+                    after 10000
+                }
+                set data_load_elapsed [expr {[clock seconds] - $data_load_start}]
+                puts "Data population completed in $data_load_elapsed seconds"
+            } else {
+                #Single-threaded data load (legacy single-process build).
+                set mystart $pg_first_ware
+                set myend $ware_end
+                puts "Start:[ clock format [ clock seconds ] ]"
+                LoadWare $lda $mystart $myend $MAXITEMS $DIST_PER_WARE
+                LoadCust $lda $mystart $myend $CUST_PER_DIST $DIST_PER_WARE $ora_compatible
+                LoadOrd $lda $mystart $myend $MAXITEMS $ORD_PER_DIST $DIST_PER_WARE $ora_compatible
+                puts "End:[ clock format [ clock seconds ] ]"
                 set result [ pg_exec $lda "commit" ]
                 pg_result $result -clear
+                set data_load_elapsed [expr {[clock seconds] - $data_load_start}]
+                puts "Data population completed in $data_load_elapsed seconds"
+            }
+            if { $forced_phase } {
+                pg_disconnect $lda
+                return
+            }
+            #Fall through to post-data only for single-process full builds; multi-runner
+            #Phase-2 invocations stop here and let the pilot orchestrate Phase 3.
+            if { $did_ddl || $threaded eq "SINGLE-THREADED" } {
+                set phase "post_data"
+            } else {
+                pg_disconnect $lda
+                return
             }
         }
-        if { $threaded eq "MULTI-THREADED" } {
-            tsv::set application load "READY"
-            LoadItems $lda $MAXITEMS
-            puts "Monitoring Workers..."
-            set prevactive 0
-            while 1 {
-                set idlcnt 0; set lvcnt 0; set dncnt 0;
-                for {set th 2} {$th <= $totalvirtualusers } {incr th} {
-                    switch [tsv::lindex common thrdlst $th] {
-                        idle { incr idlcnt }
-                        active { incr lvcnt }
-                        done { incr dncnt }
-                    }
+        # ---- PHASE 3: POST-DATA (indexes + stored procs + stats) ----
+        if { $phase eq "post_data" } {
+            if { $lda eq "" } {
+                set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+                if { $lda eq "Failed" } {
+                    error "error, the database connection to $host could not be established"
                 }
-                if { $lvcnt != $prevactive } {
-                    puts "Workers: $lvcnt Active $dncnt Done"
-                }
-                set prevactive $lvcnt
-                if { $dncnt eq [expr  $totalvirtualusers - 1] } { break }
-                after 10000
             }
-        } else {
-            LoadItems $lda $MAXITEMS
+            set index_start [clock seconds]
+            CreateIndexes $lda
+            set index_elapsed [expr {[clock seconds] - $index_start}]
+            puts "Index creation completed in $index_elapsed seconds"
+            set sproc_start [clock seconds]
+            CreateStoredProcs $lda $ora_compatible $citus_compatible $pg_storedprocs
+            set sproc_elapsed [expr {[clock seconds] - $sproc_start}]
+            puts "Stored procedures creation completed in $sproc_elapsed seconds"
+            GatherStatistics $lda
+            set total_elapsed [expr {[clock seconds] - $schema_start_seconds}]
+            puts "Schema build total: $total_elapsed seconds (DDL: ${ddl_elapsed}s, Data: ${data_load_elapsed}s, Index: ${index_elapsed}s, StoredProcs: ${sproc_elapsed}s)"
+            puts "[ string toupper $user ] SCHEMA COMPLETE"
+            pg_disconnect $lda
+            return
         }
+        pg_disconnect $lda
+        return
     }
-    if { $threaded eq "SINGLE-THREADED" ||  $threaded eq "MULTI-THREADED" && $myposition != 1 } {
-        if { $threaded eq "MULTI-THREADED" } {
-            puts "Waiting for Monitor Thread..."
-            set mtcnt 0
-            while 1 { 
-                if { [ tsv::exists application load ] } {
-                    incr mtcnt
-                    if {  [ tsv::get application load ] eq "READY" } { break }
-                    if {  [ tsv::get application abort ]  } { return }
-                    if { $mtcnt eq 48 } { 
-                        puts "Monitor failed to notify ready state" 
-                        return
-                    }
+    if { $threaded eq "MULTI-THREADED" && $myposition != 1 } {
+        puts "Waiting for Monitor Thread..."
+        set mtcnt 0
+        while 1 {
+            if { [ tsv::exists application load ] } {
+                incr mtcnt
+                if {  [ tsv::get application load ] eq "READY" } { break }
+                if {  [ tsv::get application abort ]  } { return }
+                if { $mtcnt eq 48 } {
+                    puts "Monitor failed to notify ready state"
+                    return
                 }
-                after 5000 
             }
-            set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
-            if { $lda eq "Failed" } {
-                error "error, the database connection to $host could not be established"
-            }
-            set remb [ lassign [ findchunk $num_vu $count_ware $myposition ] chunk mystart myend ]
-            puts "Loading $chunk Warehouses start:$mystart end:$myend"
-            tsv::lreplace common thrdlst $myposition $myposition active
-        } else {
-            set mystart 1
-            set myend $count_ware
+            after 5000
         }
+        set lda [ ConnectToPostgres $host $port $sslmode $user $password $db ]
+        if { $lda eq "Failed" } {
+            error "error, the database connection to $host could not be established"
+        }
+        set remb [ lassign [ findchunk $num_vu $count_ware $myposition ] chunk mystart myend ]
+        incr mystart [ expr {$pg_first_ware - 1} ]
+        incr myend   [ expr {$pg_first_ware - 1} ]
+        puts "Loading $chunk Warehouses start:$mystart end:$myend"
+        tsv::lreplace common thrdlst $myposition $myposition active
         puts "Start:[ clock format [ clock seconds ] ]"
         LoadWare $lda $mystart $myend $MAXITEMS $DIST_PER_WARE
         LoadCust $lda $mystart $myend $CUST_PER_DIST $DIST_PER_WARE $ora_compatible
@@ -2248,21 +2405,11 @@ proc do_tpcc { host port sslmode count_ware superuser superuser_password default
         puts "End:[ clock format [ clock seconds ] ]"
         set result [ pg_exec $lda "commit" ]
         pg_result $result -clear
-        if { $threaded eq "MULTI-THREADED" } {
-            tsv::lreplace common thrdlst $myposition $myposition done
-        }
-    }
-    if { $threaded eq "SINGLE-THREADED" || $threaded eq "MULTI-THREADED" && $myposition eq 1 } {
-        CreateIndexes $lda
-        CreateStoredProcs $lda $ora_compatible $citus_compatible $pg_storedprocs
-        GatherStatistics $lda 
-        puts "[ string toupper $user ] SCHEMA COMPLETE"
-        pg_disconnect $lda
-        return
+        tsv::lreplace common thrdlst $myposition $myposition done
     }
 }
 }
-        .ed_mainFrame.mainwin.textFrame.left.text fastinsert end "do_tpcc $pg_host $pg_port $pg_sslmode $pg_count_ware $pg_superuser [ quotemeta $pg_superuserpass ] $pg_defaultdbase $pg_dbase $pg_tspace $pg_user [ quotemeta $pg_pass ] $pg_oracompat $pg_cituscompat $pg_storedprocs $pg_partition $pg_num_vu"
+    .ed_mainFrame.mainwin.textFrame.left.text fastinsert end "do_tpcc $pg_host $pg_port $pg_sslmode $pg_count_ware $pg_superuser [ quotemeta $pg_superuserpass ] $pg_defaultdbase $pg_dbase $pg_tspace $pg_user [ quotemeta $pg_pass ] $pg_oracompat $pg_cituscompat $pg_storedprocs $pg_partition $pg_num_vu $pg_first_ware $pg_build_phase"
     } else { return }
 }
 

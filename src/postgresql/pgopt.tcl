@@ -204,9 +204,12 @@ proc configpgtpcc {option} {
     upvar #0 configpostgresql configpostgresql
     #set variables to values in dict
     setlocaltpccvars $configpostgresql
+    if { ![ info exists pg_build_phase ] || $pg_build_phase eq "" } {
+        set pg_build_phase "auto"
+    }
     #set matching fields in dialog to temporary dict
     variable pgfields
-    set pgfields [ dict create connection {pg_host {.tpc.c1.e1 get} pg_port {.tpc.c1.e2 get} pg_sslmode $pg_sslmode} tpcc {pg_superuser {.tpc.c1.e3 get} pg_superuserpass {.tpc.c1.e4 get} pg_defaultdbase {.tpc.c1.e5 get} pg_user {.tpc.c1.e6 get} pg_pass {.tpc.c1.e7 get} pg_dbase {.tpc.c1.e8 get} pg_tspace {.tpc.f1.e8a get} pg_total_iterations {.tpc.f1.e15 get} pg_rampup {.tpc.f1.e21 get} pg_duration {.tpc.f1.e22 get} pg_async_client {.tpc.f1.e26 get} pg_async_delay {.tpc.f1.e27 get} pg_count_ware $pg_count_ware pg_vacuum $pg_vacuum pg_dritasnap $pg_dritasnap pg_oracompat $pg_oracompat pg_cituscompat $pg_cituscompat pg_storedprocs $pg_storedprocs pg_partition $pg_partition pg_num_vu $pg_num_vu pg_total_iterations $pg_total_iterations pg_raiseerror $pg_raiseerror pg_keyandthink $pg_keyandthink pg_driver $pg_driver pg_rampup $pg_rampup pg_duration $pg_duration pg_allwarehouse $pg_allwarehouse pg_timeprofile $pg_timeprofile pg_async_scale $pg_async_scale pg_connect_pool $pg_connect_pool pg_async_verbose $pg_async_verbose}]
+    set pgfields [ dict create connection {pg_host {.tpc.c1.e1 get} pg_port {.tpc.c1.e2 get} pg_sslmode $pg_sslmode} tpcc {pg_superuser {.tpc.c1.e3 get} pg_superuserpass {.tpc.c1.e4 get} pg_defaultdbase {.tpc.c1.e5 get} pg_user {.tpc.c1.e6 get} pg_pass {.tpc.c1.e7 get} pg_dbase {.tpc.c1.e8 get} pg_tspace {.tpc.f1.e8a get} pg_total_iterations {.tpc.f1.e15 get} pg_rampup {.tpc.f1.e21 get} pg_duration {.tpc.f1.e22 get} pg_async_client {.tpc.f1.e26 get} pg_async_delay {.tpc.f1.e27 get} pg_count_ware $pg_count_ware pg_first_ware $pg_first_ware pg_build_phase $pg_build_phase pg_vacuum $pg_vacuum pg_dritasnap $pg_dritasnap pg_oracompat $pg_oracompat pg_cituscompat $pg_cituscompat pg_storedprocs $pg_storedprocs pg_partition $pg_partition pg_num_vu $pg_num_vu pg_total_iterations $pg_total_iterations pg_raiseerror $pg_raiseerror pg_keyandthink $pg_keyandthink pg_driver $pg_driver pg_rampup $pg_rampup pg_duration $pg_duration pg_allwarehouse $pg_allwarehouse pg_timeprofile $pg_timeprofile pg_async_scale $pg_async_scale pg_connect_pool $pg_connect_pool pg_async_verbose $pg_async_verbose}]
     set whlist [ get_warehouse_list_for_spinbox ]
     if { $pg_oracompat eq "true" } {
         if { $pg_port eq "5432" } { set pg_port "5444" }
@@ -356,11 +359,37 @@ proc configpgtpcc {option} {
     grid $Prompt -column 0 -row 13 -sticky e
     grid $Name -column 1 -row 13 -sticky w
     if { $option eq "all" || $option eq "build" } {
+        proc validate_pg_build_fields {} {
+            global pg_count_ware pg_first_ware pg_build_phase pg_num_vu
+            if { ![ string is integer -strict $pg_count_ware ] || $pg_count_ware < 0 } {
+                set pg_count_ware 0
+            }
+            if { ![ string is integer -strict $pg_first_ware ] || $pg_first_ware < 1 } {
+                set pg_first_ware 1
+            }
+            if { $pg_count_ware > 0 && $pg_first_ware > $pg_count_ware } {
+                set pg_first_ware $pg_count_ware
+            }
+            if { $pg_build_phase eq "ddl" } {
+                set pg_first_ware 1
+            }
+            if { $pg_build_phase eq "post_data" } {
+                set pg_count_ware 0
+                set pg_num_vu 1
+            }
+            if { $pg_build_phase eq "data" && $pg_count_ware == 0 } {
+                set pg_count_ware 1
+            }
+            if {$pg_num_vu > $pg_count_ware && $pg_count_ware > 0} {
+                set pg_num_vu $pg_count_ware
+            }
+        }
         set Prompt $Parent.f1.p10
         ttk::label $Prompt -text "Number of Warehouses :"
         set Name $Parent.f1.e10
         ttk::spinbox $Name -value $whlist -textvariable pg_count_ware
         bind .tpc.f1.e10 <<Any-Button-Any-Key>> {
+            validate_pg_build_fields
             if {$pg_num_vu > $pg_count_ware} {
                 set pg_num_vu $pg_count_ware
             }
@@ -373,28 +402,47 @@ proc configpgtpcc {option} {
         }
         grid $Prompt -column 0 -row 14 -sticky e
         grid $Name -column 1 -row 14 -sticky ew
+        set Prompt $Parent.f1.p10a
+        ttk::label $Prompt -text "First Warehouse Number :"
+        set Name $Parent.f1.e10a
+        ttk::spinbox $Name -from 1 -to 100000 -textvariable pg_first_ware
+        bind .tpc.f1.e10a <<Any-Button-Any-Key>> {
+            validate_pg_build_fields
+        }
+        grid $Prompt -column 0 -row 15 -sticky e
+        grid $Name -column 1 -row 15 -sticky ew
         set Prompt $Parent.f1.p11
         ttk::label $Prompt -text "Virtual Users to Build Schema :"
         set Name $Parent.f1.e11
         ttk::spinbox $Name -from 1 -to 100000 -textvariable pg_num_vu
         bind .tpc.f1.e11 <<Any-Button-Any-Key>> {
+            validate_pg_build_fields
             if {$pg_num_vu > $pg_count_ware} {
                 set pg_num_vu $pg_count_ware
             }
         }
         event add <<Any-Button-Any-Key>> <Any-ButtonRelease>
         event add <<Any-Button-Any-Key>> <KeyRelease>
-        grid $Prompt -column 0 -row 15 -sticky e
-        grid $Name -column 1 -row 15 -sticky ew
+        grid $Prompt -column 0 -row 16 -sticky e
+        grid $Name -column 1 -row 16 -sticky ew
         set Prompt $Parent.f1.p11a
         ttk::label $Prompt -text "Partition Order Line Table :"
         set Name $Parent.f1.e11a
         ttk::checkbutton $Name -text "" -variable pg_partition -onvalue "true" -offvalue "false"
-        grid $Prompt -column 0 -row 16 -sticky e
-        grid $Name -column 1 -row 16 -sticky w
+        grid $Prompt -column 0 -row 17 -sticky e
+        grid $Name -column 1 -row 17 -sticky w
         if {$pg_count_ware < 200 } {
             $Name configure -state disabled
         }
+        set Prompt $Parent.f1.p24
+        ttk::label $Prompt -text "Build Phase :"
+        set Name $Parent.f1.e24
+        ttk::combobox $Name -values {auto ddl data post_data} -state readonly -textvariable pg_build_phase
+        bind .tpc.f1.e24 <<ComboboxSelected>> {
+            validate_pg_build_fields
+        }
+        grid $Prompt -column 0 -row 25 -sticky e
+        grid $Name -column 1 -row 25 -sticky ew
         set Prompt $Parent.f1.p9a
         ttk::label $Prompt -text "PostgreSQL Stored Procedures :"
         set Name $Parent.f1.e9a
@@ -402,8 +450,9 @@ proc configpgtpcc {option} {
         if {$pg_oracompat == "true" } {
         $Name configure -state disabled
         }
-        grid $Prompt -column 0 -row 25 -sticky e
-        grid $Name -column 1 -row 25 -sticky w
+        grid $Prompt -column 0 -row 26 -sticky e
+        grid $Name -column 1 -row 26 -sticky w
+        validate_pg_build_fields
     }
     if { $option eq "all" || $option eq "drive" } {
         if { $option eq "all" } {
